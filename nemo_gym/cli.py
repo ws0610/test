@@ -14,6 +14,7 @@
 import asyncio
 import json
 import shlex
+import tomllib
 from glob import glob
 from os import environ, makedirs
 from os.path import exists
@@ -23,13 +24,15 @@ from threading import Thread
 from time import sleep
 from typing import Dict, List, Optional
 
+import rich
 import uvicorn
 from devtools import pprint
 from omegaconf import DictConfig, OmegaConf
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tqdm.auto import tqdm
 
 from nemo_gym import PARENT_DIR
+from nemo_gym.config_types import BaseNeMoGymCLIConfig
 from nemo_gym.global_config import (
     NEMO_GYM_CONFIG_DICT_ENV_VAR_NAME,
     NEMO_GYM_CONFIG_PATH_ENV_VAR_NAME,
@@ -60,22 +63,31 @@ def _run_command(command: str, working_directory: Path) -> Popen:  # pragma: no 
     return Popen(command, executable="/bin/bash", shell=True, env=custom_env)
 
 
-class RunConfig(BaseModel):
-    entrypoint: str
+class RunConfig(BaseNeMoGymCLIConfig):
+    entrypoint: str = Field(
+        description="Entrypoint for this command. This must be a relative path with 2 parts. Should look something like `responses_api_agents/simple_agent`."
+    )
 
 
 class TestConfig(RunConfig):
-    should_validate_data: bool = False
+    should_validate_data: bool = Field(
+        default=False,
+        description="Whether or not to validate the example data (examples, metrics, rollouts, etc) for this server.",
+    )
 
-    dir_path: Path = None  # initialized in model_post_init
+    _dir_path: Path  # initialized in model_post_init
 
     def model_post_init(self, context):  # pragma: no cover
         # TODO: This currently only handles relative entrypoints. Later on we can resolve the absolute path.
-        self.dir_path = Path(self.entrypoint)
+        self._dir_path = Path(self.entrypoint)
         assert not self.dir_path.is_absolute()
         assert len(self.dir_path.parts) == 2
 
         return super().model_post_init(context)
+
+    @property
+    def dir_path(self) -> Path:
+        return self._dir_path
 
 
 class ServerInstanceDisplayConfig(BaseModel):
@@ -274,6 +286,10 @@ Waiting for servers to spin up. Sleeping {sleep_interval}s..."""
 def run(
     global_config_dict_parser_config: Optional[GlobalConfigDictParserConfig] = None,
 ):  # pragma: no cover
+    global_config_dict = get_global_config_dict(global_config_dict_parser_config=global_config_dict_parser_config)
+    # Just here for help
+    BaseNeMoGymCLIConfig.model_validate(global_config_dict)
+
     rh = RunHelper()
     rh.start(global_config_dict_parser_config)
     rh.run_forever()
@@ -386,8 +402,11 @@ def _format_pct(count: int, total: int) -> str:  # pragma: no cover
     return f"{count} / {total} ({100 * count / total:.2f}%)"
 
 
-class TestAllConfig(BaseModel):
-    fail_on_total_and_test_mismatch: bool = False
+class TestAllConfig(BaseNeMoGymCLIConfig):
+    fail_on_total_and_test_mismatch: bool = Field(
+        default=False,
+        description="There may be situations where there are an un-equal number of servers that exist vs have tests. This flag will fail the test job if this mismatch exists.",
+    )
 
 
 def test_all():  # pragma: no cover
@@ -474,6 +493,10 @@ Extra candidate paths:{_display_list_of_paths(extra_candidates)}"""
 
 
 def dev_test():  # pragma: no cover
+    global_config_dict = get_global_config_dict()
+    # Just here for help
+    BaseNeMoGymCLIConfig.model_validate(global_config_dict)
+
     proc = Popen("pytest --cov=. --durations=10", shell=True)
     exit(proc.wait())
 
@@ -592,4 +615,28 @@ Dependencies
 
 def dump_config():  # pragma: no cover
     global_config_dict = get_global_config_dict()
+    # Just here for help
+    BaseNeMoGymCLIConfig.model_validate(global_config_dict)
+
     print(OmegaConf.to_yaml(global_config_dict, resolve=True))
+
+
+def display_help():  # pragma: no cover
+    global_config_dict = get_global_config_dict()
+    # Just here for help
+    BaseNeMoGymCLIConfig.model_validate(global_config_dict)
+
+    pyproject_path = Path(PARENT_DIR) / "pyproject.toml"
+    with pyproject_path.open("rb") as f:
+        pyproject_data = tomllib.load(f)
+
+    project_scripts = pyproject_data["project"]["scripts"]
+    rich.print("""Run a command with `+h=true` or `+help=true` to see more detailed information!
+
+[bold]Available CLI scripts[/bold]
+-----------------""")
+    for script in project_scripts:
+        if not script.startswith("ng_"):
+            continue
+
+        print(script)
