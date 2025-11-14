@@ -33,8 +33,8 @@ Servers that provide tools for agents to use and verifiers that score agent perf
 **Examples:**
 - `simple_weather`: Mock weather API for testing and tutorials
 - `google_search`: Web search capabilities via Google Search API  
-- `python_math_exec`: Python code execution environment for mathematical reasoning
-- `library_judge_math`: Mathematical problem verification using symbolic computation
+- `math_with_code`: Python code execution environment for mathematical reasoning
+- `math_with_judge`: Mathematical problem verification using symbolic computation
 - `mcqa`: Multiple choice question answering evaluation
 - `instruction_following`: General instruction compliance scoring
 
