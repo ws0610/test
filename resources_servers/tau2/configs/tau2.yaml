@@ -1,0 +1,33 @@
+tau2_resources_server:
+  resources_servers:
+    tau2:
+      entrypoint: app.py
+      domain: agent
+      verified: false
+      description: "tau2-bench environment and evaluator resources server"
+
+tau2_agent:
+  responses_api_agents:
+    tau2_agent:
+      entrypoint: app.py
+      resources_server:
+        type: resources_servers
+        name: tau2_resources_server
+      model_server:
+        type: responses_api_models
+        name: policy_model
+      user_model_server:
+        type: responses_api_models
+        name: user_model
+      domain: airline
+      max_steps: 100
+      max_errors: 10
+
+# User-simulator model server (can share the same API key or use a different one)
+user_model:
+  responses_api_models:
+    openai_model:
+      entrypoint: app.py
+      openai_base_url: ${user_base_url:${policy_base_url}}
+      openai_api_key: ${user_api_key:${policy_api_key}}
+      openai_model: ${user_model_name:${policy_model_name}}

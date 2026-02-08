@@ -1,0 +1,49 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Client script to run a tau2-bench evaluation episode.
+
+Usage:
+    python resources_servers/tau2/client.py
+
+Requires servers to be running:
+    ng_run "+config_paths=[resources_servers/tau2/configs/tau2.yaml,responses_api_models/openai_model/configs/openai_model.yaml]"
+"""
+import json
+from asyncio import run
+
+from nemo_gym.openai_utils import NeMoGymResponseCreateParamsNonStreaming
+from nemo_gym.server_utils import ServerClient
+
+
+server_client = ServerClient.load_from_global_config()
+
+# Run a full episode: seed -> orchestrate -> verify
+task = server_client.post(
+    server_name="tau2_agent",
+    url_path="/run",
+    json={
+        "responses_create_params": NeMoGymResponseCreateParamsNonStreaming(
+            input=[],
+        ).model_dump(exclude_unset=True),
+        "domain": "airline",
+        "task_id": "0",  # Replace with actual task ID from the domain
+        "task_split_name": "base",
+        "evaluation_type": "all",
+    },
+)
+result = run(task)
+response_json = run(result.json())
+print(json.dumps(response_json, indent=4, default=str))
+print(f"\nReward: {response_json.get('reward', 'N/A')}")
