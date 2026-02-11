@@ -27,10 +27,17 @@ Message management mirrors τ²-bench:
   - agent_messages: agent's accumulated view (system_messages + messages)
   - user_messages: user's accumulated view (system_messages + flip_roles(messages))
   - trajectory (all_outputs): complete unfiltered history
+
+Orchestration follows τ²-bench Orchestrator.step() pattern:
+  - State machine with (from_role, to_role) routing
+  - USER/ENV → AGENT: call Target-Agent LLM
+  - AGENT → ENV: execute pending tool calls
+  - AGENT/ENV → USER: call User-Simulator LLM
 """
 import json
 import logging
 import uuid
+from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from fastapi import Request, Response
@@ -84,6 +91,17 @@ STOP_MARKERS = {"###STOP###", "###TRANSFER###", "###OUT-OF-SCOPE###"}
 
 
 # ---------------------------------------------------------------------------
+# Role enum (mirrors τ²-bench orchestrator.Role)
+# ---------------------------------------------------------------------------
+
+
+class Role(str, Enum):
+    AGENT = "agent"
+    USER = "user"
+    ENV = "env"
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -132,6 +150,10 @@ class EpisodeState:
       - agent_messages: messages the agent LLM has seen/produced
       - user_messages: messages the user-sim LLM has seen/produced (original roles, flipped at call time)
       - tau2_messages: complete trajectory for evaluation
+
+    Orchestration state (mirrors τ²-bench Orchestrator):
+      - from_role / to_role: current routing direction
+      - done: whether the episode has terminated
     """
 
     def __init__(self, episode_id: str, domain: str, task_id: str):
@@ -158,6 +180,19 @@ class EpisodeState:
         self.user_scenario: Optional[dict] = None
         self.simulation_guidelines: str = ""
         self.agent_system_prompt: str = ""
+
+        # Orchestration state (mirrors τ²-bench Orchestrator)
+        self.from_role: Optional[Role] = None
+        self.to_role: Optional[Role] = None
+        self.done: bool = False
+        self.all_outputs: List[Any] = []
+        self.last_agent_resp: Optional[NeMoGymResponse] = None
+        self._pending_fn_calls: List[NeMoGymResponseFunctionToolCall] = []
+
+        # Per-server cookies (managed across steps)
+        self.model_server_cookies: Optional[dict] = None
+        self.user_model_cookies: Optional[dict] = None
+        self.resources_server_cookies: Optional[dict] = None
 
 
 # ---------------------------------------------------------------------------
@@ -225,37 +260,27 @@ def _flip_user_messages(user_messages: List[Any]) -> List[Any]:
 class Tau2Agent(SimpleResponsesAPIAgent):
     config: Tau2AgentConfig
 
-    async def _orchestrate(
-        self,
-        episode: EpisodeState,
-        cookies: Optional[dict] = None,
-        max_steps: Optional[int] = None,
-    ) -> tuple[NeMoGymResponse, EpisodeState]:
-        """Core orchestration loop implementing the τ²-bench turn-based interaction.
+    async def _step(self, episode: EpisodeState) -> None:
+        """Perform one step of the orchestration.
 
-        Uses episode.agent_messages and episode.user_messages which are managed
-        separately, mirroring τ²-bench's agent_state.messages / user_state.messages.
+        Mirrors τ²-bench Orchestrator.step() — a state machine that routes
+        messages between AGENT, USER, and ENV based on (from_role, to_role):
 
-        Returns:
-            Tuple of (final NeMoGymResponse with all outputs, updated EpisodeState).
+          - USER/ENV → AGENT: call Target-Agent LLM
+          - AGENT → ENV: execute pending tool calls
+          - AGENT/ENV → USER: call User-Simulator LLM
+
+        Updates episode.from_role, episode.to_role, and episode.done.
         """
-        effective_max_steps = max_steps or self.config.max_steps
-        model_server_cookies = None
-        user_model_cookies = None
-        resources_server_cookies = cookies
+        if episode.done:
+            return
 
-        all_outputs = []
-        last_agent_resp = None
+        logger.debug(
+            f"Step {episode.turn_index}: {episode.from_role} → {episode.to_role}"
+        )
 
-        step = 0
-        while step < effective_max_steps:
-            step += 1
-            episode.turn_index += 1
-
-            # -----------------------------------------------------------
-            # Step 1: Call Target-Agent (policy LLM)
-            # Input = system_messages + agent_messages (τ²-bench pattern)
-            # -----------------------------------------------------------
+        # ── USER/ENV → AGENT: Call Target-Agent LLM ──────────────────────
+        if episode.to_role == Role.AGENT:
             agent_input: List[Any] = []
             if episode.agent_system_prompt:
                 agent_input.append(
@@ -272,43 +297,36 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                 server_name=self.config.model_server.name,
                 url_path="/v1/responses",
                 json=agent_body,
-                cookies=model_server_cookies,
+                cookies=episode.model_server_cookies,
             )
             await raise_for_status(agent_response)
             agent_response_json = await get_response_json(agent_response)
-            model_server_cookies = agent_response.cookies
+            episode.model_server_cookies = agent_response.cookies
 
             try:
                 agent_resp = NeMoGymResponse.model_validate(agent_response_json)
-            except ValidationError as e:
+            except ValidationError:
                 logger.error(f"Invalid model response: {json.dumps(agent_response_json)}")
                 episode.termination_reason = "agent_error"
-                break
+                episode.done = True
+                return
 
-            last_agent_resp = agent_resp
-            output = agent_resp.output
+            episode.last_agent_resp = agent_resp
 
             # Classify outputs
             fn_calls: List[NeMoGymResponseFunctionToolCall] = [
-                o for o in output if o.type == "function_call"
+                o for o in agent_resp.output if o.type == "function_call"
             ]
             output_messages: List[NeMoGymResponseOutputMessage] = [
-                o for o in output if o.type == "message" and o.role == "assistant"
+                o for o in agent_resp.output if o.type == "message" and o.role == "assistant"
             ]
 
-            # -----------------------------------------------------------
-            # Step 2: If tool calls → forward to Environment, then loop
-            # Agent tool calls go to agent_messages only (user doesn't see them)
-            # -----------------------------------------------------------
             if fn_calls:
-                episode.consecutive_errors = 0
-
+                # Agent made tool calls → record them, route to ENV
                 for fn_call in fn_calls:
-                    # Append to agent_messages (agent sees its own tool calls)
                     episode.agent_messages.append(fn_call)
-                    all_outputs.append(fn_call)
+                    episode.all_outputs.append(fn_call)
 
-                    # Log to τ² messages
                     tool_args = json.loads(fn_call.arguments) if isinstance(fn_call.arguments, str) else fn_call.arguments
                     episode.tau2_messages.append({
                         "role": "assistant",
@@ -321,168 +339,235 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                         }],
                     })
 
-                    # Execute tool via resources server
-                    tool_response = await self.server_client.post(
-                        server_name=self.config.resources_server.name,
-                        url_path="/execute_tool",
-                        json={
-                            "tool_name": fn_call.name,
-                            "arguments": tool_args,
-                            "tool_call_id": fn_call.call_id,
-                            "requestor": "assistant",
-                        },
-                        cookies=resources_server_cookies,
-                    )
-                    resources_server_cookies = tool_response.cookies
-                    tool_result = await get_response_json(tool_response)
+                episode._pending_fn_calls = fn_calls
+                episode.from_role = Role.AGENT
+                episode.to_role = Role.ENV
 
-                    tool_content = tool_result.get("content", "")
-                    tool_error = tool_result.get("error", False)
-                    tool_call_id = tool_result.get("tool_call_id", fn_call.call_id)
-
-                    if tool_error:
-                        episode.error_count += 1
-                        episode.consecutive_errors += 1
-                        if episode.consecutive_errors >= self.config.max_errors:
-                            episode.termination_reason = "too_many_errors"
-                            break
-
-                    # Append tool result to agent_messages only
-                    tool_output = NeMoGymFunctionCallOutput(
-                        type="function_call_output",
-                        call_id=tool_call_id,
-                        output=tool_content,
-                    )
-                    episode.agent_messages.append(tool_output)
-                    all_outputs.append(tool_output)
-
-                    # Log to τ² messages
-                    episode.tau2_messages.append({
-                        "role": "tool",
-                        "id": tool_call_id,
-                        "content": tool_content,
-                        "requestor": "assistant",
-                        "error": tool_error,
-                    })
-
-                if episode.termination_reason == "too_many_errors":
-                    break
-
-                # Continue the ReAct loop — call Target-Agent again
-                continue
-
-            # -----------------------------------------------------------
-            # Step 3: Normal assistant message → append to both states → check stop
-            # -----------------------------------------------------------
-            if output_messages:
-                terminated = False
+            elif output_messages:
+                # Agent sent text → record it, route to USER
                 for msg in output_messages:
-                    # Append raw output to agent_messages (agent sees its own output)
                     episode.agent_messages.append(msg)
-                    all_outputs.append(msg)
+                    episode.all_outputs.append(msg)
 
                     assistant_text = _extract_assistant_text(msg)
-
-                    # Append as simple message to user_messages (user sees agent text)
                     if assistant_text:
                         episode.user_messages.append(
                             NeMoGymEasyInputMessage(role="assistant", content=assistant_text)
                         )
 
-                    # Log to τ² messages
                     episode.tau2_messages.append({
                         "role": "assistant",
                         "content": assistant_text,
                     })
 
-                    # Check for termination
                     if _is_stop_message(assistant_text):
                         episode.termination_reason = "agent_stop"
-                        terminated = True
+                        episode.done = True
+                        return
+
+                episode.from_role = Role.AGENT
+                episode.to_role = Role.USER
+
+            else:
+                # No tool calls and no output messages — should not happen
+                logger.warning("Target-Agent produced neither tool calls nor messages.")
+                episode.termination_reason = "agent_error"
+                episode.done = True
+                return
+
+        # ── AGENT/USER → ENV: Execute pending tool calls ────────────────
+        elif episode.to_role == Role.ENV:
+            episode.consecutive_errors = 0
+            # requestor tracks who made the tool call (mirrors τ²-bench ToolMessage.requestor)
+            requestor = "assistant" if episode.from_role == Role.AGENT else "user"
+
+            for fn_call in episode._pending_fn_calls:
+                tool_args = json.loads(fn_call.arguments) if isinstance(fn_call.arguments, str) else fn_call.arguments
+
+                tool_response = await self.server_client.post(
+                    server_name=self.config.resources_server.name,
+                    url_path="/execute_tool",
+                    json={
+                        "tool_name": fn_call.name,
+                        "arguments": tool_args,
+                        "tool_call_id": fn_call.call_id,
+                        "requestor": requestor,
+                    },
+                    cookies=episode.resources_server_cookies,
+                )
+                episode.resources_server_cookies = tool_response.cookies
+                tool_result = await get_response_json(tool_response)
+
+                tool_content = tool_result.get("content", "")
+                tool_error = tool_result.get("error", False)
+                tool_call_id = tool_result.get("tool_call_id", fn_call.call_id)
+
+                if tool_error:
+                    episode.error_count += 1
+                    episode.consecutive_errors += 1
+                    if episode.consecutive_errors >= self.config.max_errors:
+                        episode.termination_reason = "too_many_errors"
+                        episode.done = True
                         break
 
-                if terminated:
-                    break
-
-                # -----------------------------------------------------------
-                # Step 4: Call User-Simulator
-                # Input = system_messages + flip_roles(user_messages) (τ²-bench pattern)
-                # -----------------------------------------------------------
-                user_system_prompt = _build_user_sim_system_prompt(
-                    user_scenario=episode.user_scenario,
-                    simulation_guidelines=episode.simulation_guidelines,
+                tool_output = NeMoGymFunctionCallOutput(
+                    type="function_call_output",
+                    call_id=tool_call_id,
+                    output=tool_content,
                 )
-                user_input: List[Any] = [
-                    NeMoGymEasyInputMessage(role="system", content=user_system_prompt)
-                ]
-                user_input.extend(_flip_user_messages(episode.user_messages))
+                # Tool result goes to whoever made the call
+                if episode.from_role == Role.AGENT:
+                    episode.agent_messages.append(tool_output)
+                else:
+                    episode.user_messages.append(tool_output)
+                episode.all_outputs.append(tool_output)
 
-                user_sim_body = NeMoGymResponseCreateParamsNonStreaming(
-                    input=user_input,
-                    tools=[],
-                )
+                episode.tau2_messages.append({
+                    "role": "tool",
+                    "id": tool_call_id,
+                    "content": tool_content,
+                    "requestor": requestor,
+                    "error": tool_error,
+                })
 
-                user_response = await self.server_client.post(
-                    server_name=self.config.user_model_server.name,
-                    url_path="/v1/responses",
-                    json=user_sim_body,
-                    cookies=user_model_cookies,
-                )
-                await raise_for_status(user_response)
-                user_response_json = await get_response_json(user_response)
-                user_model_cookies = user_response.cookies
+            episode._pending_fn_calls = []
+            # Route back to whoever made the call (mirrors τ²-bench: self.to_role = self.from_role)
+            episode.to_role = episode.from_role
+            episode.from_role = Role.ENV
 
-                try:
-                    user_resp = NeMoGymResponse.model_validate(user_response_json)
-                except ValidationError as e:
-                    logger.error(f"Invalid user model response: {json.dumps(user_response_json)}")
-                    episode.termination_reason = "user_error"
-                    break
+        # ── AGENT/ENV → USER: Call User-Simulator ────────────────────────
+        elif episode.to_role == Role.USER:
+            user_system_prompt = _build_user_sim_system_prompt(
+                user_scenario=episode.user_scenario,
+                simulation_guidelines=episode.simulation_guidelines,
+            )
+            user_input: List[Any] = [
+                NeMoGymEasyInputMessage(role="system", content=user_system_prompt)
+            ]
+            user_input.extend(_flip_user_messages(episode.user_messages))
 
-                # Extract user text from the model output
+            user_sim_body = NeMoGymResponseCreateParamsNonStreaming(
+                input=user_input,
+                tools=[],
+            )
+
+            user_response = await self.server_client.post(
+                server_name=self.config.user_model_server.name,
+                url_path="/v1/responses",
+                json=user_sim_body,
+                cookies=episode.user_model_cookies,
+            )
+            await raise_for_status(user_response)
+            user_response_json = await get_response_json(user_response)
+            episode.user_model_cookies = user_response.cookies
+
+            try:
+                user_resp = NeMoGymResponse.model_validate(user_response_json)
+            except ValidationError:
+                logger.error(f"Invalid user model response: {json.dumps(user_response_json)}")
+                episode.termination_reason = "user_error"
+                episode.done = True
+                return
+
+            # Classify user outputs (mirrors agent classification in AGENT step)
+            user_fn_calls: List[NeMoGymResponseFunctionToolCall] = [
+                o for o in user_resp.output if o.type == "function_call"
+            ]
+            user_output_messages: List[NeMoGymResponseOutputMessage] = [
+                o for o in user_resp.output if o.type == "message"
+            ]
+
+            if user_fn_calls:
+                # User made tool calls → record them, route to ENV
+                # (mirrors τ²-bench: user_msg.is_tool_call() → to_role = ENV)
+                for fn_call in user_fn_calls:
+                    episode.user_messages.append(fn_call)
+                    episode.all_outputs.append(fn_call)
+
+                    tool_args = json.loads(fn_call.arguments) if isinstance(fn_call.arguments, str) else fn_call.arguments
+                    episode.tau2_messages.append({
+                        "role": "user",
+                        "content": None,
+                        "tool_calls": [{
+                            "id": fn_call.call_id,
+                            "name": fn_call.name,
+                            "arguments": tool_args,
+                            "requestor": "user",
+                        }],
+                    })
+
+                episode._pending_fn_calls = user_fn_calls
+                episode.from_role = Role.USER
+                episode.to_role = Role.ENV
+
+            elif user_output_messages:
+                # User sent text → extract, check stop, route to AGENT
+                # (mirrors τ²-bench: not user_msg.is_tool_call() → to_role = AGENT)
                 user_text = None
-                for out in user_resp.output:
-                    if out.type == "message":
-                        user_text = _extract_assistant_text(out)
+                for out in user_output_messages:
+                    user_text = _extract_assistant_text(out)
+                    if user_text:
                         break
-
                 if user_text is None:
                     user_text = ""
 
-                # Build user message
                 user_msg = NeMoGymEasyInputMessage(role="user", content=user_text)
-
-                # Append to both states (user's output, agent's next input)
                 episode.user_messages.append(user_msg)
                 episode.agent_messages.append(user_msg)
-                all_outputs.append(user_msg)
+                episode.all_outputs.append(user_msg)
 
-                # Log to τ² messages
-                episode.tau2_messages.append({
-                    "role": "user",
-                    "content": user_text,
-                })
+                episode.tau2_messages.append({"role": "user", "content": user_text})
 
-                # Check if user signals stop
                 if _is_stop_message(user_text):
                     episode.termination_reason = "user_stop"
-                    break
+                    episode.done = True
+                    return
 
-                # Continue loop
+                episode.from_role = Role.USER
+                episode.to_role = Role.AGENT
+
+            else:
+                logger.warning("User-Simulator produced neither tool calls nor messages.")
+                episode.termination_reason = "user_error"
+                episode.done = True
+                return
+
+        else:
+            raise ValueError(
+                f"Invalid role combination: from={episode.from_role}, to={episode.to_role}"
+            )
+
+        episode.turn_index += 1
+
+    async def _orchestrate(
+        self,
+        episode: EpisodeState,
+        max_steps: Optional[int] = None,
+    ) -> tuple[NeMoGymResponse, EpisodeState]:
+        """Core orchestration loop — calls _step() until done.
+
+        Mirrors τ²-bench Orchestrator.run(): repeatedly calls step() and
+        checks termination conditions after each non-ENV step.
+        """
+        effective_max_steps = max_steps or self.config.max_steps
+
+        while not episode.done:
+            await self._step(episode)
+
+            # Check max_steps/max_errors only when not routing to ENV
+            # (tool execution steps are "free", matching τ²-bench behavior)
+            if episode.to_role == Role.ENV:
                 continue
-
-            # No tool calls and no output messages — should not happen
-            logger.warning("Target-Agent produced neither tool calls nor messages. Breaking.")
-            episode.termination_reason = "agent_error"
-            break
-
-        # Check for max_steps termination
-        if episode.termination_reason is None:
-            episode.termination_reason = "max_steps"
+            if episode.turn_index >= effective_max_steps:
+                episode.done = True
+                episode.termination_reason = "max_steps"
+            if episode.error_count >= self.config.max_errors:
+                episode.done = True
+                episode.termination_reason = "too_many_errors"
 
         # Build final response using the last agent response as a base
-        if last_agent_resp is not None:
-            final_response = last_agent_resp
+        if episode.last_agent_resp is not None:
+            final_response = episode.last_agent_resp
         else:
             final_response = NeMoGymResponse.model_validate({
                 "id": str(uuid.uuid4()),
@@ -491,7 +576,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                 "object": "response",
                 "output": [],
             })
-        final_response.output = all_outputs
+        final_response.output = episode.all_outputs
 
         return final_response, episode
 
@@ -517,15 +602,17 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             task_id=self.config.task_id or "",
         )
         episode.tools = body.tools if body.tools else []
+        episode.resources_server_cookies = request.cookies
 
         # Populate agent_messages from input
         for msg in body.input:
             episode.agent_messages.append(msg)
 
-        final_response, _ = await self._orchestrate(
-            episode=episode,
-            cookies=request.cookies,
-        )
+        # Initial state: input provided → agent should respond next
+        episode.from_role = Role.USER
+        episode.to_role = Role.AGENT
+
+        final_response, _ = await self._orchestrate(episode=episode)
 
         return final_response
 
@@ -571,6 +658,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         episode.environment_info = seed_data.get("environment_info")
         episode.user_scenario = seed_data.get("user_scenario")
         episode.simulation_guidelines = seed_data.get("simulation_guidelines", "")
+        episode.resources_server_cookies = cookies
 
         # Build agent system prompt (matches τ²-bench LLMAgent.system_prompt)
         env_info = seed_data.get("environment_info", {})
@@ -652,9 +740,12 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         # -----------------------------------------------------------
         # 4. Run orchestration loop
         # -----------------------------------------------------------
+        # After initialization, the last message is from USER → agent responds next
+        episode.from_role = Role.USER
+        episode.to_role = Role.AGENT
+
         response_result, episode = await self._orchestrate(
             episode=episode,
-            cookies=cookies,
             max_steps=max_steps,
         )
 
