@@ -22,6 +22,11 @@ Implements the SPEC's turn-based orchestration loop:
 
 The response_agent is NOT the policy model — it NEVER generates NL responses itself.
 Target-Agent and User-Simulator are strictly separated.
+
+Message management mirrors τ²-bench:
+  - agent_messages: agent's accumulated view (system_messages + messages)
+  - user_messages: user's accumulated view (system_messages + flip_roles(messages))
+  - trajectory (all_outputs): complete unfiltered history
 """
 import json
 import logging
@@ -121,7 +126,13 @@ class Tau2AgentVerifyResponse(BaseVerifyResponse):
 
 
 class EpisodeState:
-    """Tracks the full state of an orchestration episode."""
+    """Tracks the full state of an orchestration episode.
+
+    Mirrors τ²-bench's separate state management:
+      - agent_messages: messages the agent LLM has seen/produced
+      - user_messages: messages the user-sim LLM has seen/produced (original roles, flipped at call time)
+      - tau2_messages: complete trajectory for evaluation
+    """
 
     def __init__(self, episode_id: str, domain: str, task_id: str):
         self.episode_id = episode_id
@@ -131,6 +142,10 @@ class EpisodeState:
         self.error_count = 0
         self.consecutive_errors = 0
         self.termination_reason: Optional[str] = None
+
+        # Separate message histories (mirrors τ²-bench agent_state / user_state)
+        self.agent_messages: List[Any] = []
+        self.user_messages: List[Any] = []
 
         # τ² message history (serialized dicts for verification)
         self.tau2_messages: List[dict] = []
@@ -150,65 +165,6 @@ class EpisodeState:
 # ---------------------------------------------------------------------------
 
 
-class _TaggedMessage:
-    """Wraps a conversation message with a requestor tag.
-
-    NeMoGymFunctionCallOutput has no requestor field, so we wrap it
-    to distinguish agent vs user tool interactions in the conversation.
-    The inner `msg` is the actual NeMoGym type sent to the LLM.
-    """
-
-    def __init__(self, msg: Any, requestor: str = "assistant"):
-        self.msg = msg
-        self.requestor = requestor
-        # Proxy type/role so filter functions can inspect without unwrapping
-        self.type = getattr(msg, "type", None)
-        self.role = getattr(msg, "role", None)
-
-
-def _build_agent_input(
-    conversation: List[Any],
-    agent_system_prompt: str,
-) -> List[Any]:
-    """Build filtered input for Target-Agent LLM call.
-
-    Mirrors τ²-bench is_valid_agent_history_message:
-      - AssistantMessage (text + tool calls)
-      - UserMessage (text only, NOT user tool calls)
-      - ToolMessage with requestor="assistant" only
-    """
-    agent_input: List[Any] = []
-    if agent_system_prompt:
-        agent_input.append(
-            NeMoGymEasyInputMessage(role="system", content=agent_system_prompt)
-        )
-
-    for item in conversation:
-        msg = item.msg if isinstance(item, _TaggedMessage) else item
-        requestor = item.requestor if isinstance(item, _TaggedMessage) else "assistant"
-
-        # function_call (agent's tool call) → agent sees it
-        if hasattr(msg, "type") and msg.type == "function_call":
-            agent_input.append(msg)
-            continue
-
-        # function_call_output → agent only sees its own (requestor="assistant")
-        if hasattr(msg, "type") and msg.type == "function_call_output":
-            if requestor == "assistant":
-                agent_input.append(msg)
-            continue
-
-        if hasattr(msg, "role"):
-            if msg.role == "system":
-                continue
-            elif msg.role == "assistant":
-                agent_input.append(msg)
-            elif msg.role == "user":
-                agent_input.append(msg)
-
-    return agent_input
-
-
 def _extract_assistant_text(output: NeMoGymResponseOutputMessage) -> Optional[str]:
     """Extract text content from an assistant output message."""
     texts = []
@@ -225,81 +181,40 @@ def _is_stop_message(text: Optional[str]) -> bool:
     return any(marker in text for marker in STOP_MARKERS)
 
 
-def _build_user_simulator_input(
-    conversation: List[Any],
+def _build_user_sim_system_prompt(
     user_scenario: Optional[dict],
     simulation_guidelines: str = "",
-) -> NeMoGymResponseCreateParamsNonStreaming:
-    """Build the input for the User-Simulator LLM call.
-
-    Mirrors τ²-bench's UserSimulator.system_prompt:
-      {global_user_sim_guidelines}
-      <scenario>
-      {instructions}
-      </scenario>
-
-    The user-simulator receives the conversation history plus a system
-    instruction containing simulation guidelines and the user scenario
-    so it can role-play the user.
-    """
-    # Extract instructions from user_scenario (pass as-is, matching τ²-bench)
+) -> str:
+    """Build user-simulator system prompt matching τ²-bench format."""
     instructions = ""
     if user_scenario:
         instructions = user_scenario.get("instructions", "")
+    return f"{simulation_guidelines}\n\n<scenario>\n{instructions}\n</scenario>"
 
-    # Build system prompt matching τ²-bench format:
-    # {global_user_sim_guidelines}\n\n<scenario>\n{instructions}\n</scenario>
-    system_prompt = f"{simulation_guidelines}\n\n<scenario>\n{instructions}\n</scenario>"
 
-    # Build input: system message + conversation history with flipped roles.
-    # Mirrors τ²-bench UserState.flip_roles():
-    #   - AssistantMessage (text only) → "user" (agent's words become input)
-    #   - UserMessage → "assistant" (user's words become sim LLM's prior output)
-    #   - ToolMessage requestor="user" → kept as tool (user's tool results)
-    #   - Agent tool calls / tool results → skipped (not visible to user)
-    #   - System messages → skipped (sim has its own system prompt)
-    input_messages = [NeMoGymEasyInputMessage(role="system", content=system_prompt)]
+def _flip_user_messages(user_messages: List[Any]) -> List[Any]:
+    """Flip roles in user_messages for the user-simulator LLM.
 
-    for item in conversation:
-        msg = item.msg if isinstance(item, _TaggedMessage) else item
-        requestor = item.requestor if isinstance(item, _TaggedMessage) else "assistant"
-
-        # function_call → always agent's, skip for user-sim
-        if hasattr(msg, "type") and msg.type == "function_call":
-            continue
-
-        # function_call_output → user sees only its own (requestor="user")
+    Mirrors τ²-bench UserState.flip_roles():
+      - AssistantMessage (agent text) → role="user" (input to sim LLM)
+      - UserMessage (user text) → role="assistant" (sim LLM's prior output)
+      - function_call_output (user tool result) → kept as-is
+    """
+    flipped = []
+    for msg in user_messages:
         if hasattr(msg, "type") and msg.type == "function_call_output":
-            if requestor == "user":
-                input_messages.append(msg)
+            # User's tool result — keep as-is
+            flipped.append(msg)
             continue
 
         if hasattr(msg, "role"):
-            if msg.role == "system":
-                continue
-            elif msg.role == "assistant":
-                # Agent's message → flip to "user" for the sim LLM
-                content = msg.content if hasattr(msg, "content") else None
-                if content is None and hasattr(msg, "text"):
-                    content = msg.text
-                # Extract text from NeMoGymResponseOutputMessage
-                if content is None and hasattr(msg, "type") and msg.type == "message":
-                    content = _extract_assistant_text(msg)
-                if content:
-                    input_messages.append(
-                        NeMoGymEasyInputMessage(role="user", content=content)
-                    )
+            if msg.role == "assistant":
+                content = msg.content if isinstance(msg.content, str) else ""
+                flipped.append(NeMoGymEasyInputMessage(role="user", content=content))
             elif msg.role == "user":
-                # User's message → flip to "assistant" for the sim LLM
-                content = msg.content if hasattr(msg, "content") else ""
-                input_messages.append(
-                    NeMoGymEasyInputMessage(role="assistant", content=content)
-                )
-
-    return NeMoGymResponseCreateParamsNonStreaming(
-        input=input_messages,
-        tools=[],
-    )
+                content = msg.content if isinstance(msg.content, str) else ""
+                flipped.append(NeMoGymEasyInputMessage(role="assistant", content=content))
+    return flipped
 
 
 # ---------------------------------------------------------------------------
@@ -312,14 +227,14 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
     async def _orchestrate(
         self,
-        input_messages: List[Any],
         episode: EpisodeState,
         cookies: Optional[dict] = None,
         max_steps: Optional[int] = None,
     ) -> tuple[NeMoGymResponse, EpisodeState]:
         """Core orchestration loop implementing the τ²-bench turn-based interaction.
 
-        Coordinates Target-Agent ↔ User-Simulator ↔ Environment.
+        Uses episode.agent_messages and episode.user_messages which are managed
+        separately, mirroring τ²-bench's agent_state.messages / user_state.messages.
 
         Returns:
             Tuple of (final NeMoGymResponse with all outputs, updated EpisodeState).
@@ -329,7 +244,6 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         user_model_cookies = None
         resources_server_cookies = cookies
 
-        conversation = list(input_messages)
         all_outputs = []
         last_agent_resp = None
 
@@ -340,12 +254,14 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
             # -----------------------------------------------------------
             # Step 1: Call Target-Agent (policy LLM)
-            # Filter conversation for agent (matches τ²-bench: system_messages + agent-visible messages)
+            # Input = system_messages + agent_messages (τ²-bench pattern)
             # -----------------------------------------------------------
-            agent_input = _build_agent_input(
-                conversation=conversation,
-                agent_system_prompt=episode.agent_system_prompt,
-            )
+            agent_input: List[Any] = []
+            if episode.agent_system_prompt:
+                agent_input.append(
+                    NeMoGymEasyInputMessage(role="system", content=episode.agent_system_prompt)
+                )
+            agent_input.extend(episode.agent_messages)
 
             agent_body = NeMoGymResponseCreateParamsNonStreaming(
                 input=agent_input,
@@ -382,13 +298,14 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
             # -----------------------------------------------------------
             # Step 2: If tool calls → forward to Environment, then loop
+            # Agent tool calls go to agent_messages only (user doesn't see them)
             # -----------------------------------------------------------
             if fn_calls:
                 episode.consecutive_errors = 0
 
                 for fn_call in fn_calls:
-                    # Add function_call to conversation (tagged as agent's)
-                    conversation.append(_TaggedMessage(fn_call, requestor="assistant"))
+                    # Append to agent_messages (agent sees its own tool calls)
+                    episode.agent_messages.append(fn_call)
                     all_outputs.append(fn_call)
 
                     # Log to τ² messages
@@ -430,13 +347,13 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                             episode.termination_reason = "too_many_errors"
                             break
 
-                    # Append tool result to conversation (tagged with requestor)
+                    # Append tool result to agent_messages only
                     tool_output = NeMoGymFunctionCallOutput(
                         type="function_call_output",
                         call_id=tool_call_id,
                         output=tool_content,
                     )
-                    conversation.append(_TaggedMessage(tool_output, requestor="assistant"))
+                    episode.agent_messages.append(tool_output)
                     all_outputs.append(tool_output)
 
                     # Log to τ² messages
@@ -455,15 +372,22 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                 continue
 
             # -----------------------------------------------------------
-            # Step 3: Normal assistant message → check DONE → call User-Sim
+            # Step 3: Normal assistant message → append to both states → check stop
             # -----------------------------------------------------------
             if output_messages:
                 terminated = False
                 for msg in output_messages:
-                    conversation.append(msg) #agent output (아마도 asssitant로 들어갈거다)
+                    # Append raw output to agent_messages (agent sees its own output)
+                    episode.agent_messages.append(msg)
                     all_outputs.append(msg)
 
                     assistant_text = _extract_assistant_text(msg)
+
+                    # Append as simple message to user_messages (user sees agent text)
+                    if assistant_text:
+                        episode.user_messages.append(
+                            NeMoGymEasyInputMessage(role="assistant", content=assistant_text)
+                        )
 
                     # Log to τ² messages
                     episode.tau2_messages.append({
@@ -482,11 +406,20 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
                 # -----------------------------------------------------------
                 # Step 4: Call User-Simulator
+                # Input = system_messages + flip_roles(user_messages) (τ²-bench pattern)
                 # -----------------------------------------------------------
-                user_sim_body = _build_user_simulator_input(
-                    conversation=conversation,
+                user_system_prompt = _build_user_sim_system_prompt(
                     user_scenario=episode.user_scenario,
                     simulation_guidelines=episode.simulation_guidelines,
+                )
+                user_input: List[Any] = [
+                    NeMoGymEasyInputMessage(role="system", content=user_system_prompt)
+                ]
+                user_input.extend(_flip_user_messages(episode.user_messages))
+
+                user_sim_body = NeMoGymResponseCreateParamsNonStreaming(
+                    input=user_input,
+                    tools=[],
                 )
 
                 user_response = await self.server_client.post(
@@ -516,18 +449,21 @@ class Tau2Agent(SimpleResponsesAPIAgent):
                 if user_text is None:
                     user_text = ""
 
+                # Build user message
+                user_msg = NeMoGymEasyInputMessage(role="user", content=user_text)
+
+                # Append to both states (user's output, agent's next input)
+                episode.user_messages.append(user_msg)
+                episode.agent_messages.append(user_msg)
+                all_outputs.append(user_msg)
+
                 # Log to τ² messages
                 episode.tau2_messages.append({
                     "role": "user",
                     "content": user_text,
                 })
 
-                # Append user message to conversation
-                user_msg = NeMoGymEasyInputMessage(role="user", content=user_text)
-                conversation.append(user_msg)
-                all_outputs.append(user_msg)
-
-                # Check if user signals done
+                # Check if user signals stop
                 if _is_stop_message(user_text):
                     episode.termination_reason = "user_stop"
                     break
@@ -582,8 +518,11 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         )
         episode.tools = body.tools if body.tools else []
 
+        # Populate agent_messages from input
+        for msg in body.input:
+            episode.agent_messages.append(msg)
+
         final_response, _ = await self._orchestrate(
-            input_messages=body.input,
             episode=episode,
             cookies=request.cookies,
         )
@@ -621,7 +560,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         seed_data = await get_response_json(seed_response)
 
         # -----------------------------------------------------------
-        # 2. Build initial conversation and episode state
+        # 2. Build episode state
         # -----------------------------------------------------------
         episode = EpisodeState(
             episode_id=str(uuid.uuid4()),
@@ -633,11 +572,6 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         episode.user_scenario = seed_data.get("user_scenario")
         episode.simulation_guidelines = seed_data.get("simulation_guidelines", "")
 
-        # Pre-populate τ² messages from task initial state
-        initial_messages = seed_data.get("initial_messages", [])
-        for msg_dict in initial_messages:
-            episode.tau2_messages.append(msg_dict)
-
         # Build agent system prompt (matches τ²-bench LLMAgent.system_prompt)
         env_info = seed_data.get("environment_info", {})
         domain_policy = env_info.get("policy", "")
@@ -646,69 +580,86 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             domain_policy=domain_policy,
         )
 
-        input_messages: List[Any] = []
+        # -----------------------------------------------------------
+        # 3. Initialize message histories (mirrors τ²-bench initialize())
+        # -----------------------------------------------------------
+        initial_messages = seed_data.get("initial_messages", [])
 
-        # Add initial messages from task history as conversation context
-        # Include all message types (assistant, user, tool) — filtering is done
-        # at call time by _build_agent_input / _build_user_simulator_input
+        # Pre-populate τ² messages from task initial state
         for msg_dict in initial_messages:
-            role = msg_dict.get("role", "user")
-            content = msg_dict.get("content")
-            if role == "tool":
-                # Tool results from initial state (tagged with requestor)
-                tool_output = NeMoGymFunctionCallOutput(
-                    type="function_call_output",
-                    call_id=msg_dict.get("id", ""),
-                    output=content or "",
-                )
-                requestor = msg_dict.get("requestor", "assistant")
-                input_messages.append(_TaggedMessage(tool_output, requestor=requestor))
-            elif role in ("user", "assistant") and content:
-                input_messages.append(
-                    NeMoGymEasyInputMessage(role=role, content=content)
-                )
+            episode.tau2_messages.append(msg_dict)
 
-        # τ²-bench flow: Agent sends first greeting, then User-Simulator responds.
-        # Only do this when there are no initial messages from the task.
-        has_user_msg = any(
-            hasattr(m, "role") and m.role == "user"
-            for m in input_messages
-        )
-        if not has_user_msg:
-            # Step A: Add default agent first message (matches τ²-bench)
-            input_messages.append(
-                NeMoGymEasyInputMessage(role="assistant", content=DEFAULT_FIRST_AGENT_MESSAGE)
+        if initial_messages:
+            # Populate agent_messages and user_messages from initial history
+            # Mirrors τ²-bench: filter by is_valid_agent/user_history_message
+            for msg_dict in initial_messages:
+                role = msg_dict.get("role", "user")
+                content = msg_dict.get("content")
+                requestor = msg_dict.get("requestor", "assistant")
+
+                if role == "assistant" and content:
+                    msg = NeMoGymEasyInputMessage(role="assistant", content=content)
+                    episode.agent_messages.append(msg)
+                    # User sees agent text (non-tool-call only)
+                    if "tool_calls" not in msg_dict or not msg_dict["tool_calls"]:
+                        episode.user_messages.append(msg)
+                elif role == "user" and content:
+                    msg = NeMoGymEasyInputMessage(role="user", content=content)
+                    episode.agent_messages.append(msg)
+                    episode.user_messages.append(msg)
+                elif role == "tool":
+                    tool_output = NeMoGymFunctionCallOutput(
+                        type="function_call_output",
+                        call_id=msg_dict.get("id", ""),
+                        output=content or "",
+                    )
+                    if requestor == "assistant":
+                        episode.agent_messages.append(tool_output)
+                    elif requestor == "user":
+                        episode.user_messages.append(tool_output)
+        else:
+            # Default case: no initial messages
+            # τ²-bench: agent sends greeting, user_state is empty, then user responds
+            greeting_msg = NeMoGymEasyInputMessage(
+                role="assistant", content=DEFAULT_FIRST_AGENT_MESSAGE
             )
+
+            # Agent has sent the greeting
+            episode.agent_messages.append(greeting_msg)
             episode.tau2_messages.append({
                 "role": "assistant",
                 "content": DEFAULT_FIRST_AGENT_MESSAGE,
             })
 
-            # Step B: Call User-Simulator to generate the first user response
+            # Call User-Simulator to respond to greeting
             if episode.user_scenario:
-                first_user_msg = await self._get_initial_user_message(
-                    input_messages=input_messages,
-                    user_scenario=episode.user_scenario,
-                    simulation_guidelines=episode.simulation_guidelines,
+                # User receives greeting (append to user_messages before calling)
+                episode.user_messages.append(greeting_msg)
+
+                first_user_text = await self._get_initial_user_message(
+                    episode=episode,
                     cookies=cookies,
                 )
-                input_messages.append(
-                    NeMoGymEasyInputMessage(role="user", content=first_user_msg)
-                )
-                episode.tau2_messages.append({"role": "user", "content": first_user_msg})#user가 답변해서 assitant로 나왔지만 user로 등록..그러면 agent에 던질 때 수정안해도됨.
+                first_user_msg = NeMoGymEasyInputMessage(role="user", content=first_user_text)
+
+                # User's output → append to user_messages
+                episode.user_messages.append(first_user_msg)
+                # Agent's next input → append to agent_messages
+                episode.agent_messages.append(first_user_msg)
+
+                episode.tau2_messages.append({"role": "user", "content": first_user_text})
 
         # -----------------------------------------------------------
-        # 3. Run orchestration loop
+        # 4. Run orchestration loop
         # -----------------------------------------------------------
         response_result, episode = await self._orchestrate(
-            input_messages=input_messages,
             episode=episode,
             cookies=cookies,
             max_steps=max_steps,
         )
 
         # -----------------------------------------------------------
-        # 4. Verify
+        # 5. Verify
         # -----------------------------------------------------------
         verify_request_data = {
             "domain": domain,
@@ -735,21 +686,26 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
     async def _get_initial_user_message(
         self,
-        input_messages: List[Any],
-        user_scenario: dict,
-        simulation_guidelines: str = "",
+        episode: EpisodeState,
         cookies: Optional[dict] = None,
     ) -> str:
         """Generate the initial user message via the User-Simulator LLM.
 
-        In τ²-bench, the agent sends "Hi! How can I help you today?" first,
-        and the user simulator responds to it. input_messages should already
-        contain the agent's greeting at this point.
+        Uses episode.user_messages (which should contain the agent greeting)
+        and flips roles before sending to the user-sim LLM.
         """
-        user_sim_body = _build_user_simulator_input(
-            conversation=input_messages,
-            user_scenario=user_scenario,
-            simulation_guidelines=simulation_guidelines,
+        user_system_prompt = _build_user_sim_system_prompt(
+            user_scenario=episode.user_scenario,
+            simulation_guidelines=episode.simulation_guidelines,
+        )
+        user_input: List[Any] = [
+            NeMoGymEasyInputMessage(role="system", content=user_system_prompt)
+        ]
+        user_input.extend(_flip_user_messages(episode.user_messages))
+
+        user_sim_body = NeMoGymResponseCreateParamsNonStreaming(
+            input=user_input,
+            tools=[],
         )
 
         user_response = await self.server_client.post(
@@ -772,7 +728,7 @@ class Tau2Agent(SimpleResponsesAPIAgent):
             logger.warning(f"Failed to get initial user message from simulator: {e}")
 
         # Fallback: derive from user scenario
-        instructions = user_scenario.get("instructions", "")
+        instructions = episode.user_scenario.get("instructions", "") if episode.user_scenario else ""
         if isinstance(instructions, dict):
             return instructions.get("reason_for_call", "Hello, I need help.")
         elif isinstance(instructions, str):
