@@ -50,6 +50,7 @@ from tau2.data_model.tasks import Task
 from tau2.environment.environment import Environment, EnvironmentInfo
 from tau2.evaluator.evaluator import EvaluationType, evaluate_simulation
 from tau2.registry import registry
+from tau2.user.user_simulator import get_global_user_sim_guidelines
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +74,7 @@ class Tau2SeedSessionResponse(BaseSeedSessionResponse):
     environment_info: Optional[dict] = None
     initial_messages: List[dict] = Field(default_factory=list)
     user_scenario: Optional[dict] = None
+    simulation_guidelines: str = ""
 
 
 class Tau2ExecuteToolRequest(BaseModel):
@@ -227,6 +229,10 @@ class Tau2ResourcesServer(SimpleResourcesServer):
         tool_schemas = self._get_tool_schemas(environment)
         env_info = environment.get_info(include_tool_info=False)
 
+        # Load simulation guidelines (use tools variant if environment has tools)
+        use_tools = len(tool_schemas) > 0
+        simulation_guidelines = get_global_user_sim_guidelines(use_tools=use_tools)
+
         return Tau2SeedSessionResponse(
             session_id=session_id,
             domain=body.domain,
@@ -235,6 +241,7 @@ class Tau2ResourcesServer(SimpleResourcesServer):
             environment_info=env_info.model_dump(),
             initial_messages=initial_messages_dicts,
             user_scenario=task.user_scenario.model_dump(),
+            simulation_guidelines=simulation_guidelines,
         )
 
     async def execute_tool(self, request: Request, body: Tau2ExecuteToolRequest) -> Tau2ExecuteToolResponse:
