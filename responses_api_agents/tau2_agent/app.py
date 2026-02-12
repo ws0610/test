@@ -36,6 +36,8 @@ Orchestration follows τ²-bench Orchestrator.step() pattern:
 """
 import json
 import logging
+import math
+import random
 import uuid
 from enum import Enum
 from typing import Any, Dict, List, Optional
@@ -115,6 +117,8 @@ class Tau2AgentConfig(BaseResponsesAPIAgentConfig):
     task_split_name: Optional[str] = "base"
     max_steps: int = 100
     max_errors: int = 10
+    num_trials: int = 1  # Number of trials per task (for pass^k metrics)
+    seed: Optional[int] = None  # Random seed for trial reproducibility
 
 
 # ---------------------------------------------------------------------------
@@ -130,6 +134,8 @@ class Tau2AgentRunRequest(BaseRunRequest):
     task_split_name: Optional[str] = None
     task_data: Optional[dict] = None  # Single task entry from tasks.json
     max_steps: Optional[int] = None
+    num_trials: Optional[int] = None  # Override config.num_trials
+    seed: Optional[int] = None  # Override config.seed
     evaluation_type: str = "all"
 
 
@@ -137,6 +143,53 @@ class Tau2AgentVerifyResponse(BaseVerifyResponse):
     model_config = ConfigDict(extra="allow")
 
     reward_info: Optional[dict] = None
+    trial: Optional[int] = None  # Trial index (0-based)
+
+
+class Tau2AgentRunResponse(BaseVerifyResponse):
+    """Aggregated response for multi-trial runs."""
+    model_config = ConfigDict(extra="allow")
+
+    trials: List[Tau2AgentVerifyResponse] = Field(default_factory=list)
+    num_trials: int = 1
+    avg_reward: Optional[float] = None
+    pass_hat_ks: Dict[int, float] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Metrics helpers (mirrors τ²-bench agent_metrics.py)
+# ---------------------------------------------------------------------------
+
+
+def _is_successful(reward: float) -> bool:
+    """Check if the reward indicates success (reward ≈ 1.0)."""
+    return (1 - 1e-6) <= reward <= (1 + 1e-6)
+
+
+def _pass_hat_k(num_trials: int, success_count: int, k: int) -> float:
+    """Compute pass^k metric. From https://arxiv.org/pdf/2406.12045"""
+    if num_trials < k:
+        return 0.0
+    if success_count < k:
+        return 0.0
+    return math.comb(success_count, k) / math.comb(num_trials, k)
+
+
+def _compute_trial_metrics(
+    trial_rewards: List[float],
+) -> tuple[float, Dict[int, float]]:
+    """Compute avg_reward and pass^k for a list of trial rewards.
+
+    Returns:
+        Tuple of (avg_reward, {k: pass^k for k in 1..num_trials}).
+    """
+    num_trials = len(trial_rewards)
+    avg_reward = sum(trial_rewards) / num_trials if num_trials > 0 else 0.0
+    success_count = sum(1 for r in trial_rewards if _is_successful(r))
+    pass_hat_ks = {}
+    for k in range(1, num_trials + 1):
+        pass_hat_ks[k] = _pass_hat_k(num_trials, success_count, k)
+    return avg_reward, pass_hat_ks
 
 
 # ---------------------------------------------------------------------------
@@ -625,17 +678,20 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
         return final_response
 
-    async def run(self, request: Request, body: Tau2AgentRunRequest) -> Tau2AgentVerifyResponse:
-        """Full pipeline: seed → orchestrate → verify → reward."""
-        cookies = request.cookies
+    async def run(self, request: Request, body: Tau2AgentRunRequest) -> Tau2AgentRunResponse:
+        """Full pipeline with multi-trial support.
 
-        # Resolve domain/task_id from request or config
+        Runs seed → orchestrate → verify for each trial, then computes
+        aggregated metrics (avg_reward, pass^k). Mirrors τ²-bench run_tasks().
+        """
+        # Resolve parameters from request or config
         domain = body.domain or self.config.domain
         task_data = body.task_data
         task_split_name = body.task_split_name or self.config.task_split_name
         max_steps = body.max_steps or self.config.max_steps
+        num_trials = body.num_trials or self.config.num_trials
+        seed = body.seed if body.seed is not None else self.config.seed
 
-        # If task_data is provided (single entry from tasks.json), extract task_id from it
         if task_data is not None:
             task_id = task_data.get("id", body.task_id or self.config.task_id)
         else:
@@ -644,8 +700,62 @@ class Tau2Agent(SimpleResponsesAPIAgent):
         if not task_id and task_data is None:
             raise ValueError("task_id or task_data must be provided either in the request or in the agent config.")
 
+        # Generate per-trial seeds (mirrors τ²-bench: random.seed(seed) → randint per trial)
+        rng = random.Random(seed)
+        trial_seeds = [rng.randint(0, 1_000_000) for _ in range(num_trials)]
+
+        # Run trials
+        trial_results: List[Tau2AgentVerifyResponse] = []
+        for trial_idx in range(num_trials):
+            logger.info(f"Trial {trial_idx + 1}/{num_trials} (seed={trial_seeds[trial_idx]})")
+
+            result = await self._run_single_trial(
+                request=request,
+                body=body,
+                domain=domain,
+                task_id=task_id,
+                task_data=task_data,
+                task_split_name=task_split_name,
+                max_steps=max_steps,
+                trial_seed=trial_seeds[trial_idx],
+            )
+            result.trial = trial_idx
+            trial_results.append(result)
+
+        # Compute metrics
+        trial_rewards = [
+            r.reward for r in trial_results
+            if r.reward is not None
+        ]
+        if trial_rewards:
+            avg_reward, pass_hat_ks = _compute_trial_metrics(trial_rewards)
+        else:
+            avg_reward, pass_hat_ks = 0.0, {}
+
+        return Tau2AgentRunResponse(
+            trials=trial_results,
+            num_trials=num_trials,
+            avg_reward=avg_reward,
+            pass_hat_ks=pass_hat_ks,
+            reward=avg_reward,
+        )
+
+    async def _run_single_trial(
+        self,
+        request: Request,
+        body: Tau2AgentRunRequest,
+        domain: str,
+        task_id: str,
+        task_data: Optional[dict],
+        task_split_name: Optional[str],
+        max_steps: int,
+        trial_seed: int,
+    ) -> Tau2AgentVerifyResponse:
+        """Run a single trial: seed → orchestrate → verify → reward."""
+        cookies = request.cookies
+
         # -----------------------------------------------------------
-        # 1. Seed session
+        # 1. Seed session (fresh environment per trial)
         # -----------------------------------------------------------
         seed_request: dict = {
             "domain": domain,
