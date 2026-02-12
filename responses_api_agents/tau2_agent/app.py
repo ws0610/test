@@ -324,21 +324,26 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
             if fn_calls:
                 # Agent made tool calls → record them, route to ENV
+                # tau2_messages: ONE assistant message with ALL tool_calls
+                # (get_actions_from_messages expects tool_calls[] then ToolMessages immediately after)
+                tau2_tool_calls = []
                 for fn_call in fn_calls:
                     episode.agent_messages.append(fn_call)
                     episode.all_outputs.append(fn_call)
 
                     tool_args = json.loads(fn_call.arguments) if isinstance(fn_call.arguments, str) else fn_call.arguments
-                    episode.tau2_messages.append({
-                        "role": "assistant",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": fn_call.call_id,
-                            "name": fn_call.name,
-                            "arguments": tool_args,
-                            "requestor": "assistant",
-                        }],
+                    tau2_tool_calls.append({
+                        "id": fn_call.call_id,
+                        "name": fn_call.name,
+                        "arguments": tool_args,
+                        "requestor": "assistant",
                     })
+
+                episode.tau2_messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tau2_tool_calls,
+                })
 
                 episode._pending_fn_calls = fn_calls
                 episode.from_role = Role.AGENT
@@ -480,22 +485,25 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
             if user_fn_calls:
                 # User made tool calls → record them, route to ENV
-                # (mirrors τ²-bench: user_msg.is_tool_call() → to_role = ENV)
+                # tau2_messages: ONE user message with ALL tool_calls
+                tau2_tool_calls = []
                 for fn_call in user_fn_calls:
                     episode.user_messages.append(fn_call)
                     episode.all_outputs.append(fn_call)
 
                     tool_args = json.loads(fn_call.arguments) if isinstance(fn_call.arguments, str) else fn_call.arguments
-                    episode.tau2_messages.append({
-                        "role": "user",
-                        "content": None,
-                        "tool_calls": [{
-                            "id": fn_call.call_id,
-                            "name": fn_call.name,
-                            "arguments": tool_args,
-                            "requestor": "user",
-                        }],
+                    tau2_tool_calls.append({
+                        "id": fn_call.call_id,
+                        "name": fn_call.name,
+                        "arguments": tool_args,
+                        "requestor": "user",
                     })
+
+                episode.tau2_messages.append({
+                    "role": "user",
+                    "content": None,
+                    "tool_calls": tau2_tool_calls,
+                })
 
                 episode._pending_fn_calls = user_fn_calls
                 episode.from_role = Role.USER
