@@ -62,8 +62,9 @@ logger = logging.getLogger(__name__)
 
 class Tau2SeedSessionRequest(BaseSeedSessionRequest):
     domain: str
-    task_id: str
+    task_id: Optional[str] = None
     task_split_name: Optional[str] = "base"
+    task_data: Optional[dict] = None  # Single task entry from tasks.json
 
 
 class Tau2SeedSessionResponse(BaseSeedSessionResponse):
@@ -198,9 +199,16 @@ class Tau2ResourcesServer(SimpleResourcesServer):
         """Initialize a new τ² environment session for a specific domain/task."""
         session_id = request.session[SESSION_ID_KEY]
 
-        # Create fresh environment and load task
+        # Create fresh environment
         environment = self._create_environment(body.domain)
-        task = self._load_task(body.domain, body.task_id, body.task_split_name)
+
+        # Load task: from task_data (tasks.json entry) or registry lookup
+        if body.task_data is not None:
+            task = Task.model_validate(body.task_data)
+        else:
+            if not body.task_id:
+                raise ValueError("Either task_data or task_id must be provided.")
+            task = self._load_task(body.domain, body.task_id, body.task_split_name)
 
         # Set initial state from task
         if task.initial_state is not None:
@@ -236,7 +244,7 @@ class Tau2ResourcesServer(SimpleResourcesServer):
         return Tau2SeedSessionResponse(
             session_id=session_id,
             domain=body.domain,
-            task_id=body.task_id,
+            task_id=task.id,
             tools=tool_schemas,
             environment_info=env_info.model_dump(),
             initial_messages=initial_messages_dicts,
@@ -300,8 +308,11 @@ class Tau2ResourcesServer(SimpleResourcesServer):
         """Evaluate a trajectory and return reward using τ² evaluator."""
         session_id = request.session[SESSION_ID_KEY]
 
-        # Load task (may use session or reload)
-        task = self._load_task(body.domain, body.task_id, body.task_split_name)
+        # Use task from session (set during seed_session), fall back to registry lookup
+        if session_id in self.sessions:
+            task = self.sessions[session_id].task
+        else:
+            task = self._load_task(body.domain, body.task_id, body.task_split_name)
 
         # Reconstruct τ² messages from episode_messages
         messages = _deserialize_messages(body.episode_messages)

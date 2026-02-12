@@ -128,6 +128,7 @@ class Tau2AgentRunRequest(BaseRunRequest):
     domain: Optional[str] = None
     task_id: Optional[str] = None
     task_split_name: Optional[str] = None
+    task_data: Optional[dict] = None  # Single task entry from tasks.json
     max_steps: Optional[int] = None
     evaluation_type: str = "all"
 
@@ -622,24 +623,34 @@ class Tau2Agent(SimpleResponsesAPIAgent):
 
         # Resolve domain/task_id from request or config
         domain = body.domain or self.config.domain
-        task_id = body.task_id or self.config.task_id
+        task_data = body.task_data
         task_split_name = body.task_split_name or self.config.task_split_name
         max_steps = body.max_steps or self.config.max_steps
 
-        if not task_id:
-            raise ValueError("task_id must be provided either in the request or in the agent config.")
+        # If task_data is provided (single entry from tasks.json), extract task_id from it
+        if task_data is not None:
+            task_id = task_data.get("id", body.task_id or self.config.task_id)
+        else:
+            task_id = body.task_id or self.config.task_id
+
+        if not task_id and task_data is None:
+            raise ValueError("task_id or task_data must be provided either in the request or in the agent config.")
 
         # -----------------------------------------------------------
         # 1. Seed session
         # -----------------------------------------------------------
+        seed_request: dict = {
+            "domain": domain,
+            "task_id": task_id,
+            "task_split_name": task_split_name,
+        }
+        if task_data is not None:
+            seed_request["task_data"] = task_data
+
         seed_response = await self.server_client.post(
             server_name=self.config.resources_server.name,
             url_path="/seed_session",
-            json={
-                "domain": domain,
-                "task_id": task_id,
-                "task_split_name": task_split_name,
-            },
+            json=seed_request,
             cookies=cookies,
         )
         await raise_for_status(seed_response)
